@@ -210,6 +210,9 @@ flowchart LR
     RM --> IM[IndexManager]
     RM --> HM[HeaderManager]
     RM --> FM[FileManager]
+    Table --> Schema[TableDefinition]
+    Schema --> Fields[FieldDefinition]
+    Schema --> Relations[RelationshipDefinition]
     FM --> DB[(entidade.db)]
 ```
 
@@ -246,7 +249,190 @@ public interface RecordCodec<T> {
 - `IndexManager`: mantém `ID -> posição do registro`.
 - `StorageException`: traduz erros de baixo nível para uma exceção da camada.
 
-## 8. Formato físico dos arquivos
+## 8. Definição de tabelas, campos e relacionamentos
+
+### Estratégia adotada
+
+A Fase 1 utilizará uma solução intermediária:
+
+- o mecanismo de armazenamento será genérico;
+- cada entidade terá uma tabela lógica e um arquivo `.db` próprio;
+- o esquema será declarado explicitamente no código;
+- os serializadores continuarão específicos por entidade;
+- os relacionamentos serão descritos como metadados;
+- os Services garantirão a integridade referencial.
+
+Essa estratégia demonstra conceitos reais de um SGBD sem exigir SQL, criação dinâmica de tabelas, planejador de consultas ou `JOIN` automático.
+
+```mermaid
+flowchart TB
+    Registry[SchemaRegistry]
+    Registry --> Cliente[TableDefinition clientes]
+    Registry --> Produto[TableDefinition produtos]
+    Registry --> Pedido[TableDefinition pedidos]
+    Registry --> Cupom[TableDefinition cupons]
+
+    Pedido --> PedidoFields[FieldDefinition]
+    Pedido --> PedidoRelations[RelationshipDefinition]
+    PedidoRelations -->|clienteId referencia id| Cliente
+    PedidoRelations -->|cupomId referencia id| Cupom
+
+    Produto --> ProdutoFile[(produtos.db)]
+    Cliente --> ClienteFile[(clientes.db)]
+    Pedido --> PedidoFile[(pedidos.db)]
+    Cupom --> CupomFile[(cupons.db)]
+```
+
+### `TableDefinition`
+
+Representa a definição de uma tabela lógica:
+
+```java
+public record TableDefinition(
+    short typeId,
+    String name,
+    int schemaVersion,
+    List<FieldDefinition> fields,
+    List<RelationshipDefinition> relationships
+) {}
+```
+
+Cada tabela deve possuir:
+
+- `typeId` único, também armazenado no cabeçalho do arquivo;
+- nome único;
+- versão do esquema;
+- chave primária obrigatória chamada `id`;
+- lista ordenada de campos;
+- lista de relacionamentos.
+
+### `FieldDefinition`
+
+```java
+public record FieldDefinition(
+    int order,
+    String name,
+    FieldType type,
+    boolean nullable,
+    boolean primaryKey
+) {}
+```
+
+Tipos iniciais suportados:
+
+```java
+public enum FieldType {
+    BOOLEAN,
+    INT,
+    LONG,
+    STRING,
+    DATE_TIME,
+    MONEY_CENTS
+}
+```
+
+A ordem dos campos faz parte do formato binário. Alterá-la sem mudar `schemaVersion` tornaria registros antigos incompatíveis.
+
+### `RelationshipDefinition`
+
+```java
+public record RelationshipDefinition(
+    String localField,
+    String referencedTable,
+    String referencedField,
+    RelationType relationType,
+    DeletePolicy onDelete
+) {}
+```
+
+Políticas recomendadas:
+
+```java
+public enum DeletePolicy {
+    RESTRICT,  // impede excluir enquanto houver referências
+    SET_NULL,  // remove a referência, se o campo aceitar nulo
+    NO_ACTION  // Service específico decide o comportamento
+}
+```
+
+Não implementar `CASCADE` na Fase 1. Exclusões em cascata aumentam o risco de apagar logicamente muitos registros por engano.
+
+### Exemplo de esquema de produto
+
+```java
+public final class ProdutoSchema {
+    public static final TableDefinition TABLE = new TableDefinition(
+        (short) 2,
+        "produtos",
+        1,
+        List.of(
+            new FieldDefinition(0, "id", FieldType.LONG, false, true),
+            new FieldDefinition(1, "nome", FieldType.STRING, false, false),
+            new FieldDefinition(2, "descricao", FieldType.STRING, true, false),
+            new FieldDefinition(3, "precoEmCentavos", FieldType.MONEY_CENTS, false, false),
+            new FieldDefinition(4, "estoque", FieldType.INT, false, false),
+            new FieldDefinition(5, "ativo", FieldType.BOOLEAN, false, false)
+        ),
+        List.of()
+    );
+
+    private ProdutoSchema() {}
+}
+```
+
+### Exemplo de relacionamento de pedido
+
+```java
+new RelationshipDefinition(
+    "clienteId",
+    "clientes",
+    "id",
+    RelationType.MANY_TO_ONE,
+    DeletePolicy.RESTRICT
+)
+```
+
+Isso documenta que muitos pedidos podem pertencer a um cliente. O metadado descreve a relação; a validação efetiva permanece no `PedidoService`.
+
+### Registro central dos esquemas
+
+```java
+public final class SchemaRegistry {
+    private final Map<String, TableDefinition> byName;
+    private final Map<Short, TableDefinition> byTypeId;
+
+    public SchemaRegistry(List<TableDefinition> tables) {
+        // Validar nomes, IDs, campos, chaves e referências duplicadas.
+    }
+
+    public TableDefinition requireByName(String name) { /* ... */ }
+    public TableDefinition requireByTypeId(short typeId) { /* ... */ }
+}
+```
+
+Na inicialização, o registro deve verificar:
+
+- nomes e `typeId` únicos;
+- exatamente uma chave primária por tabela;
+- nomes e ordens de campos únicos;
+- campos locais dos relacionamentos existentes;
+- tabelas e campos referenciados existentes;
+- compatibilidade de tipos entre as duas pontas da relação.
+
+### Limite importante
+
+O esquema é declarativo, mas está compilado na aplicação. A Fase 1 não terá comandos como:
+
+```text
+CREATE TABLE
+ALTER TABLE
+DROP TABLE
+SELECT ... JOIN
+```
+
+Alterar campos exige aumentar `schemaVersion` e decidir como tratar arquivos antigos. Durante a Fase 1, recomenda-se fechar o modelo antes de produzir dados definitivos.
+
+## 9. Formato físico dos arquivos
 
 Um arquivo por entidade:
 
@@ -302,7 +488,7 @@ Os nomes devem ser ajustados ao DER definitivo.
 
 Recomenda-se usar `RandomAccessFile`, `DataInputStream`, `DataOutputStream`, `ByteArrayInputStream` e `ByteArrayOutputStream`, todos da biblioteca padrão do Java.
 
-## 9. Serialização
+## 10. Serialização
 
 | Tipo | Representação |
 |---|---|
@@ -328,7 +514,7 @@ Exemplo de carga de produto:
 
 O codec deve ler na mesma ordem em que escreve.
 
-## 10. Operações físicas
+## 11. Operações físicas
 
 ### Inserir
 
@@ -364,7 +550,7 @@ Para simplificar e reduzir risco de corrupção:
 
 Essa abordagem deixa espaço morto no arquivo, recuperável posteriormente por compactação.
 
-## 11. Índice de busca
+## 12. Índice de busca
 
 Na Fase 1, utilizar um índice primário em memória:
 
@@ -389,7 +575,7 @@ flowchart LR
 
 Uma árvore B ou arquivo de índice persistente pode ser evolução posterior. O `HashMap` é suficiente enquanto o conjunto de dados couber em memória.
 
-## 12. Modelo lógico de referência
+## 13. Modelo lógico de referência
 
 ```mermaid
 erDiagram
@@ -436,7 +622,60 @@ erDiagram
 
 Como não existe SGBD externo para impor chaves estrangeiras, o Service deve verificar se os IDs relacionados existem antes de salvar.
 
-## 13. Composição manual das dependências
+### Integridade referencial
+
+Os relacionamentos utilizam IDs, equivalentes a chaves estrangeiras:
+
+```text
+Pedido.clienteId       -> Cliente.id
+Pedido.cupomId         -> Cupom.id
+ItemPedido.produtoId   -> Produto.id
+```
+
+Exemplo do fluxo para criar um pedido:
+
+```mermaid
+flowchart TB
+    Start[Receber novo pedido] --> Client{Cliente existe e está ativo?}
+    Client -->|Não| Error1[Rejeitar operação]
+    Client -->|Sim| Products{Produtos existem?}
+    Products -->|Não| Error2[Rejeitar operação]
+    Products -->|Sim| Stock{Há estoque suficiente?}
+    Stock -->|Não| Error3[Rejeitar operação]
+    Stock -->|Sim| Coupon{Possui cupom?}
+    Coupon -->|Não| Save[Salvar pedido]
+    Coupon -->|Sim| Valid{Cupom existe e é válido?}
+    Valid -->|Não| Error4[Rejeitar operação]
+    Valid -->|Sim| Save
+```
+
+Políticas iniciais sugeridas:
+
+| Relação | Política |
+|---|---|
+| Cliente com pedidos | impedir exclusão; permitir desativação |
+| Produto usado em pedidos | impedir exclusão; permitir desativação |
+| Cupom usado em pedidos | preservar o histórico; permitir desativação |
+| Pedido e seus itens | armazenar itens dentro da carga do pedido na Fase 1 |
+
+O pedido deve armazenar o preço unitário praticado em cada item. Consultar novamente o preço atual do produto alteraria incorretamente pedidos históricos.
+
+### Consultas relacionadas sem `JOIN`
+
+O mini-SGBD não executará `JOIN`. Um Service monta a visão completa em memória:
+
+```java
+public PedidoDetalhado consultarDetalhes(long pedidoId) {
+    Pedido pedido = pedidoRepository.findByIdOrThrow(pedidoId);
+    Cliente cliente = clienteRepository.findByIdOrThrow(pedido.clienteId());
+    List<Produto> produtos = carregarProdutosDosItens(pedido.itens());
+    return new PedidoDetalhado(pedido, cliente, produtos);
+}
+```
+
+Essa operação é uma composição de consultas por ID, e não uma responsabilidade da interface de console.
+
+## 14. Composição manual das dependências
 
 Sem framework, o `Main` cria e conecta os objetos explicitamente:
 
@@ -462,7 +701,7 @@ public final class Main {
 
 Isso é injeção de dependência manual: o objeto recebe suas dependências pelo construtor, sem precisar de contêiner ou framework.
 
-## 14. Estrutura sugerida de pastas
+## 15. Estrutura sugerida de pastas
 
 ```text
 projeto/
@@ -488,6 +727,18 @@ projeto/
 │       │   └── exception/
 │       ├── service/
 │       ├── repository/
+│       ├── schema/
+│       │   ├── SchemaRegistry.java
+│       │   ├── TableDefinition.java
+│       │   ├── FieldDefinition.java
+│       │   ├── FieldType.java
+│       │   ├── RelationshipDefinition.java
+│       │   ├── RelationType.java
+│       │   ├── DeletePolicy.java
+│       │   ├── ClienteSchema.java
+│       │   ├── ProdutoSchema.java
+│       │   ├── PedidoSchema.java
+│       │   └── CupomSchema.java
 │       └── minidb/
 │           ├── BinaryTable.java
 │           ├── FileBinaryTable.java
@@ -507,7 +758,7 @@ projeto/
     └── run.bat
 ```
 
-## 15. Compilação sem ferramentas externas
+## 16. Compilação sem ferramentas externas
 
 Exemplo no Windows PowerShell:
 
@@ -519,7 +770,7 @@ java -cp out Main
 
 O projeto pode incluir scripts para facilitar, mas deve continuar compilável somente com o JDK.
 
-## 16. Erros e encerramento
+## 17. Erros e encerramento
 
 ### Categorias
 
@@ -538,7 +789,7 @@ Ao sair:
 4. fechar o `Scanner` uma única vez;
 5. apresentar mensagem de encerramento.
 
-## 17. Consistência dos dados
+## 18. Consistência dos dados
 
 - Somente o mini-SGBD manipula bytes.
 - Validar `magic`, versão, tipo e tamanhos ao abrir o arquivo.
@@ -548,8 +799,10 @@ Ao sair:
 - Reconstruir o índice ao iniciar.
 - Utilizar arquivo temporário durante compactação.
 - Criar cópia de segurança antes de substituir um arquivo de dados.
+- Comparar `entityType` e `schemaVersion` do cabeçalho com o `TableDefinition` antes de ler registros.
+- Recusar a abertura de uma tabela cujo esquema seja incompatível, em vez de interpretar bytes incorretamente.
 
-## 18. Testes mínimos
+## 19. Testes mínimos
 
 Mesmo sem framework, testes podem ser classes Java executáveis com métodos auxiliares de asserção. Se a disciplina permitir JUnit, ele facilita os testes, mas não é necessário para a aplicação funcionar.
 
@@ -564,6 +817,18 @@ Mesmo sem framework, testes podem ser classes Java executáveis com métodos aux
 - detectar arquivo truncado;
 - gerar IDs únicos;
 - impedir leitura além do fim do arquivo.
+- rejeitar `typeId` diferente do esperado;
+- rejeitar versão de esquema incompatível.
+
+### Esquemas e relacionamentos
+
+- detectar tabelas com nomes ou `typeId` duplicados;
+- detectar campos com nomes ou ordens duplicadas;
+- exigir exatamente uma chave primária;
+- detectar relacionamento para tabela inexistente;
+- detectar incompatibilidade entre tipos relacionados;
+- impedir exclusão quando a política for `RESTRICT`;
+- garantir que consultas detalhadas preservem dados históricos.
 
 ### Aplicação
 
@@ -573,22 +838,22 @@ Mesmo sem framework, testes podem ser classes Java executáveis com métodos aux
 - cancelar uma operação retorna ao menu;
 - sair fecha todos os recursos.
 
-## 19. Ordem de implementação
+## 20. Ordem de implementação
 
 ```mermaid
 flowchart LR
-    A[1. Definir entidades e casos de uso] --> B[2. Especificar formato binário]
-    B --> C[3. Implementar codecs]
-    C --> D[4. Implementar mini-SGBD]
-    D --> E[5. Testar CRUD e reinicialização]
-    E --> F[6. Criar repositories]
-    F --> G[7. Criar services]
-    G --> H[8. Criar controllers]
-    H --> I[9. Criar menus]
+    A[1. Definir entidades e casos de uso] --> B[2. Declarar tabelas e relações]
+    B --> C[3. Especificar formato binário]
+    C --> D[4. Implementar codecs]
+    D --> E[5. Implementar mini-SGBD]
+    E --> F[6. Testar CRUD e reinicialização]
+    F --> G[7. Criar repositories]
+    G --> H[8. Criar services e integridade]
+    H --> I[9. Criar controllers e menus]
     I --> J[10. Testar o fluxo completo]
 ```
 
-## 20. Critérios de pronto
+## 21. Critérios de pronto
 
 - [ ] Aplicação compila apenas com o JDK.
 - [ ] Nenhum framework ou SGBD externo é utilizado.
@@ -597,14 +862,20 @@ flowchart LR
 - [ ] CRUD funciona em arquivos binários.
 - [ ] Exclusão utiliza lápide.
 - [ ] Índice é reconstruído após reiniciar.
+- [ ] Cada entidade possui um `TableDefinition` e um arquivo próprio.
+- [ ] Campos possuem nome, tipo, ordem e nulabilidade documentados.
+- [ ] Relacionamentos estão declarados em `RelationshipDefinition`.
+- [ ] Services validam referências antes de gravar.
+- [ ] Políticas de exclusão preservam o histórico.
+- [ ] Versão e tipo do esquema são conferidos ao abrir o arquivo.
 - [ ] Erros de entrada não encerram inesperadamente a aplicação.
 - [ ] Arquivos são fechados corretamente.
 - [ ] DCU e DER correspondem ao domínio definitivo.
 - [ ] README ensina a compilar e executar.
 
-## 21. Resumo para apresentação
+## 22. Resumo para apresentação
 
-> A solução é uma aplicação de console feita sem frameworks. Os menus cuidam somente da interação com o usuário; Controllers convertem as entradas; Services aplicam regras de negócio; e Repositories acessam nosso mini-SGBD. O mini-SGBD serializa objetos em bytes e os grava em arquivos binários com cabeçalho. Cada registro contém tamanho, ID e lápide. A exclusão é lógica, e um índice em memória relaciona IDs às posições no arquivo. Essa separação torna o sistema mais fácil de entender, testar e evoluir.
+> A solução é uma aplicação de console feita sem frameworks. Os menus cuidam somente da interação com o usuário; Controllers convertem as entradas; Services aplicam regras de negócio; e Repositories acessam nosso mini-SGBD. Cada entidade corresponde a uma tabela lógica, definida por metadados de campos e relacionamentos, e possui um arquivo binário próprio. O mini-SGBD grava cabeçalho, registros, IDs e lápides, enquanto um índice em memória localiza cada registro. Os Services validam as referências entre tabelas e montam consultas relacionadas sem depender de `JOIN`. Essa separação torna o sistema mais fácil de entender, testar e evoluir.
 
 ---
 
